@@ -7,17 +7,21 @@ import (
 	"unsafe"
 )
 
+// boltdb的B+Tree节点实现可分为存储中的实现（mmap memory）与内存中的实现（heap memory）两部分。
+// boltdb中node是按需实例化的，对于不需要修改的node，boltdb直接从page中读取数据；
+// 而当boltdb需要修改B+Tree的某个节点时，则会将该节点从page实例化为node。
+// 在修改node时，boltdb会为其分配page buffer（dirty page），等到事务提交时，才会将这些page buffer中的数据统一落盘。
 // node represents an in-memory, deserialized page.
 type node struct {
-	bucket     *Bucket
+	bucket     *Bucket // 关联一个桶
 	isLeaf     bool
-	unbalanced bool
-	spilled    bool
-	key        []byte
-	pgid       pgid
-	parent     *node
-	children   nodes
-	inodes     inodes
+	unbalanced bool   // 当前node是否可能不平衡。
+	spilled    bool   // 当前node是否已被调整过。
+	key        []byte // 对于分支节点的话，保留的是最小的key
+	pgid       pgid   // 该节点关联的页id
+	parent     *node  // 该节点的parent
+	children   nodes  // 该节点的孩子节点
+	inodes     inodes // 该节点上保存的索引数据, inodes 保存了该 node 的 K/V 数据:
 }
 
 // root returns the top-level node this node is attached to.
@@ -112,6 +116,10 @@ func (n *node) prevSibling() *node {
 	return n.parent.childAt(index - 1)
 }
 
+// 如果put的是一个key、value的话，不需要指定pgid。
+// 如果put的一个树枝节点，则需要指定pgid，不需要指定value
+// 插入数据可能造成 node 中的数据超过单个 page 大小
+//
 // put inserts a key/value.
 func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 	if pgid >= n.bucket.tx.meta.pgid {
@@ -140,6 +148,8 @@ func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 	_assert(len(inode.key) > 0, "put: zero-length inode key")
 }
 
+// 当删除操作导致 node 的填充率低于要求时，虽然不会立即与兄弟节点合并，
+// 但会在结束前将该 node 标记为 unbalanced，等数据要写入磁盘前再统一合并。
 // del removes a key from the node.
 func (n *node) del(key []byte) {
 	// Find index of key.
@@ -157,6 +167,8 @@ func (n *node) del(key []byte) {
 	n.unbalanced = true
 }
 
+// 当读取page构建node时，inode的key与value是直接引用的page的地址，即node构建后并非完全不在依赖其page中的数据。
+// 但是随着数据库增大，当boltdb需要重新mmap以扩展存储空间时，boltdb需要执行dereference操作
 // read initializes the node from a page.
 func (n *node) read(p *page) {
 	n.pgid = p.id
@@ -196,6 +208,7 @@ func (n *node) write(p *page) {
 		p.flags |= branchPageFlag
 	}
 
+	// 这儿叶子节点不可能溢出，因为溢出时，会分裂
 	if len(n.inodes) >= 0xFFFF {
 		panic(fmt.Sprintf("inode overflow: %d (pgid=%d)", len(n.inodes), p.id))
 	}
@@ -268,6 +281,10 @@ func (n *node) split(pageSize int) []*node {
 	return nodes
 }
 
+// parent node 超载的原因除了键值对数量过多，也可能是单个数据过大。
+// 如果是后面这种情况，spill 不会再将 node 拆分，而是保留这些超载的 node：
+// 在序列化时，这种超载的 node 会被转化为 overflow page 存储。
+//
 // splitTwo breaks up a node into two smaller nodes, if appropriate.
 // This should only be called from the split() function.
 func (n *node) splitTwo(pageSize int) (*node, *node) {
@@ -334,6 +351,11 @@ func (n *node) splitIndex(threshold int) (index, sz int) {
 	return
 }
 
+// boltdb使用COW 的方式对节点进行修改，以保证不影响并发的读事务。
+// 即，将要修改的 page 读到内存，修改并调整后，申请新的 page 将变动后的 node 落盘。
+// 这种方式可以方便的实现读写并发和事务，但无疑，其代价比较高昂，
+// 即使一个 key 的修改 / 删除，都会引起对应叶子节点所在 B+ 树路径上所有节点的修改和落盘。
+// 因此如果修改较频繁，最好在单个事务中做 Batch。
 // spill writes the nodes to dirty pages and splits nodes as it goes.
 // Returns an error if dirty pages cannot be allocated.
 func (n *node) spill() error {
@@ -360,10 +382,12 @@ func (n *node) spill() error {
 	for _, node := range nodes {
 		// Add node's page to the freelist if it's not new.
 		if node.pgid > 0 {
+			// node将写入新分配的页，所以之前的页可以被释放了
 			tx.db.freelist.free(tx.meta.txid, tx.page(node.pgid))
 			node.pgid = 0
 		}
 
+		// 分配的新页用于存储node，新页添加到tx.pages(drity-pages), tx.Commit时写入磁盘
 		// Allocate contiguous space for the node.
 		p, err := tx.allocate((node.size() / tx.db.pageSize) + 1)
 		if err != nil {
@@ -404,6 +428,7 @@ func (n *node) spill() error {
 	return nil
 }
 
+// 将填充率不足的 node 与 sibling node 合并
 // rebalance attempts to combine the node with sibling nodes if the node fill
 // size is below a threshold or if there are not enough keys.
 func (n *node) rebalance() {
@@ -518,6 +543,8 @@ func (n *node) removeChild(target *node) {
 	}
 }
 
+// dereference会递归向下地将B+Tree中已实例化的node中的数据拷贝到heap memory中（非mmap映射的内存空间），
+// 以避免unmmap时node还在引用旧的mmap的内存地址
 // dereference causes the node to copy all its inode key/value references to heap memory.
 // This is required when the mmap is reallocated so inodes are not pointing to stale data.
 func (n *node) dereference() {
@@ -587,17 +614,22 @@ func (n *node) dump() {
 
 type nodes []*node
 
-func (s nodes) Len() int           { return len(s) }
-func (s nodes) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s nodes) Less(i, j int) bool { return bytes.Compare(s[i].inodes[0].key, s[j].inodes[0].key) == -1 }
+func (s nodes) Len() int      { return len(s) }
+func (s nodes) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s nodes) Less(i, j int) bool {
+	return bytes.Compare(s[i].inodes[0].key, s[j].inodes[0].key) == -1
+}
 
 // inode represents an internal node inside of a node.
 // It can be used to point to elements in a page or point
 // to an element which hasn't been added to a page yet.
 type inode struct {
+	// 表示是否是子桶叶子节点还是普通叶子节点。如果flags值为1表示子桶叶子节点，否则为普通叶子节点
 	flags uint32
-	pgid  pgid
-	key   []byte
+	// 当inode为分支元素时，pgid才有值，为叶子元素时，则没值
+	pgid pgid
+	key  []byte
+	// 当inode为分支元素时，value为空，为叶子元素时，才有值
 	value []byte
 }
 

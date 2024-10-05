@@ -6,10 +6,33 @@ import (
 	"unsafe"
 )
 
+// boltDB 并未将删除后多出的磁盘空间还给文件系统。那么 Bolt 如何管理多出的磁盘空间呢？
+// 这个问题就是 File Organization，而 Bolt 使用的方法被称为 Heap File Organization，
+// 可以类比程序运行时的 Heap 内存管理。实际负责管理这些磁盘空间的模块就是耳熟能详的 freelist。
+//
+// freelist 负责管理空闲 pages 的分配与回收。读写事务申请磁盘空间时，
+// freelist 总是先尝试寻找一段物理上连续的满足所需大小的磁盘空间，若找到则直接分配，否则就向操作系统申请新的磁盘空间。
+//
+// 由于 freelist 总是顺序保存当前的空闲 page id，分配时就从小到大遍历一次列表，
+// 一旦发现连续的 pages 满足需求，就将其从 freelist 中移除，分配给申请空间的事务。
+//
+// 当遇到删除数据时，读写事务会将多余的磁盘空间释放回 freelist 中，此时 freelist 不会立即将其分配出去，
+// 而是将这些释放的 page 标记成 pending 状态，直到系统中不存在任何读事务依赖这些 page 中的旧数据时，才正式将其回收再分配
+
+// 但是随着BoltDB的更新操作增多，采用COW原则，每次会将原来page free，再写入新的page。所以这个过程中，就产生了free pages。
+// 这些free pages由一个单独的freelist layout page记录起来。
+// 同时，由于BoltDB的DB file大小只会随着操作grow变大，但文件大小不会缩减。
+// 所以，每次在openDB的时候，会将这些freelist加载到内存中，以供后续写操作重复利用。
+
+// 空闲列表的存储方式:
+// ptr(freelist): pgidx or len(pgids) | pgidx | pgidx | pgidx | pgidx | ... | pgidx
+
 // freelist represents a list of all pages that are available for allocation.
 // It also tracks pages that have been freed but are still in use by open transactions.
 type freelist struct {
-	ids     []pgid          // all free and available free page ids.
+	// 已经可以被分配的空闲页
+	ids []pgid // all free and available free page ids.
+	// 将来很快能被释放的空闲页，部分事务可能在读或者写
 	pending map[txid][]pgid // mapping of soon-to-be free page ids by tx.
 	cache   map[pgid]bool   // fast lookup of all free and pending page ids.
 }
@@ -106,6 +129,11 @@ func (f *freelist) allocate(n int) pgid {
 	return 0
 }
 
+// boltdb不会将空闲的页归还给系统。其原因有二：
+//
+// 1. 在不断增大的数据库中，被释放的页之后还会被重用。
+// 2. boltdb为了保证读写并发的隔离性，使用copy-on-write来更新页，因此会在任意位置产生空闲页，而不只是在文件末尾产生空闲页
+//
 // free releases a page and its overflow for a given transaction id.
 // If the page is already free then a panic will occur.
 func (f *freelist) free(txid txid, p *page) {

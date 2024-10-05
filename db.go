@@ -39,6 +39,14 @@ const (
 // default page size for db is set to the OS page size.
 var defaultPageSize = os.Getpagesize()
 
+// boltdb支持“读读并发”与“读写并发”，用来隔离事务的锁rwlock是互斥锁，只有可写事务需要获取该锁，只读事务不受影响。
+// 由于事务开始时，需要复制当时的元数据，因此这里使用了互斥锁metalock来保护事务开始时的元数据访问，当事务初始化完成后就会释放metalock；
+// 另外，只读事务关闭时也需要获取metalock，但其目的是保护对DB对象的访问，而不时保护meta。
+// 而mmaplock是用来保护mmap操作的读写锁，只读事务会获取mmaplock的S锁，而mmap操作会获取mmaplock的X锁。
+// 这样，当可写事务需要更大的mmap空间时，其需要等待之前的只读事务都执行完毕，以避免只读事务引用的mmap地址失效；
+// 对于可写事务本身，其在mmap前会从根Bucket实例开始dereference操作，以避免可写事务本身引用了旧的mmap地址空间。
+// 这三种锁的获取顺序是：（rwlock） -> metalock ->（mmaplock）。
+
 // DB represents a collection of buckets persisted to a file on disk.
 // All data access is performed through transactions which can be obtained through the DB.
 // All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
@@ -95,18 +103,18 @@ type DB struct {
 	AllocSize int
 
 	path     string
-	file     *os.File
-	lockfile *os.File // windows only
-	dataref  []byte   // mmap'ed readonly, write throws SEGV
-	data     *[maxMapSize]byte
+	file     *os.File          // 真实存储数据的磁盘文件
+	lockfile *os.File          // windows only
+	dataref  []byte            // mmap'ed readonly, write throws SEGV
+	data     *[maxMapSize]byte //  通过mmap映射进来的地址
 	datasz   int
 	filesz   int // current on disk file size
 	meta0    *meta
 	meta1    *meta
 	pageSize int
 	opened   bool
-	rwtx     *Tx
-	txs      []*Tx
+	rwtx     *Tx   // read-write transaction
+	txs      []*Tx // read-only transactions
 	freelist *freelist
 	stats    Stats
 
@@ -240,6 +248,18 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	return db, nil
 }
 
+// mmap 是操作系统提供的系统调用，它将系统中的某个文件或设备的数据直接映射到一块大小给定的虚拟内存中，
+// 这块虚拟内存可以大于或小于该文件或设备的实际所占空间大小。
+// 映射完毕后，应用程序可以认为 (实际并不会) 映射对象的数据已经全部读入内存中，
+// 任意访问这块虚拟内存中的数据，操作系统在背后全权负责数据的缓冲读写。
+//
+// Bolt 利用 mmap 管理数据的读缓冲，即让操作系统来决定何时将数据读入内存，
+// 当缓冲区大小不足时如何选择被置换的数据，Bolt 只管像访问字节数组一样访问数据库文件即可。
+// 当然，使用 mmap 也失去了数据读取的控制权，
+// 无法根据数据库系统的运行逻辑来优化数据预取 (prefetching) 及缓存置换 (buffer replacement)。
+// 话虽如此，实际情况是 Bolt 每次都选择将数据库文件 mmap 到一块不小于数据库文件本身大小的虚拟内存中，
+// 因此实际上只有 demand paging，没有 buffer replacement。
+//
 // mmap opens the underlying memory-mapped file and initializes the meta references.
 // minsz is the minimum size that the new mmap can be.
 func (db *DB) mmap(minsz int) error {
@@ -339,6 +359,12 @@ func (db *DB) mmapSize(size int) (int, error) {
 	return int(sz), nil
 }
 
+// init 内部主要是新建一个文件，
+// 然后第0页、第1页写入元数据信息；
+// 第2页写入freelist信息；
+// 第3页写入bucket leaf信息。并最终刷盘。
+// metaPage1 | metaPage2 | freelistPage | leafPage or branchPage | ...
+// freelistPage仅初始化时为pgid=2，但后续会被写入到其他页面，由meta.freelist标识
 // init creates a new database file and initializes its meta pages.
 func (db *DB) init() error {
 	// Set the page size to the OS page size.
@@ -439,6 +465,12 @@ func (db *DB) close() error {
 	return nil
 }
 
+// 如果每个 page 都带有版本，每当 page 中的数据将被读写事务修改时，
+// 就先复制数据到新申请的 page 中，然后修改相应的数据，
+// 旧版本的 page 直到没有只读事务依赖它时才被回收。
+// 使用这种方案使得 MVCC 的实现无需考虑新旧版本共存于同一个 page 的情况，
+// 用空间换取了设计复杂度的降低，符合 Bolt 的设计理念。
+
 // Begin starts a new transaction.
 // Multiple read-only transactions can be used concurrently but only one
 // write transaction can be used at a time. Starting multiple write transactions
@@ -463,12 +495,32 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 	return db.beginTx()
 }
 
+// Bolt允许的并发事务如下：
+// 1. 多个仅读事务
+// 2. 一个读写事务
+// 3. 一个读写事务, 多个仅读事务
+//
+// Bolt 这种粗粒度的并发控制意味着，即便不同事务读写的数据互不相关，
+// 只要有事务在读取整个数据库文件上的任意数据，其它事务就不能往数据库里写数据。
+// 因此使用 Bolt 时，每个读写事务的执行时间不宜太长，数据量不宜过大。
+// 如果遇到一些吞吐大的写场景，就要求数据库能够支持更细粒度的并发控制，
+// 比如支持在命名空间级别、键级别上加锁，用 Bolt 也许不是最佳选择。
 func (db *DB) beginTx() (*Tx, error) {
 	// Lock the meta pages while we initialize the transaction. We obtain
 	// the meta lock before the mmap lock because that's the order that the
 	// write transaction will obtain them.
 	db.metalock.Lock()
 
+	// 在数据存储层一节中介绍过，Bolt 将数据的读缓存托管给 mmap。
+	// 每个只读事务在启动时需要获取 mmap 的读锁，保证所读取数据的正确性；
+	// 当读写事务申请新 pages 时，可能出现当前 mmap 的空间不足，需要重新 mmap 的情况，
+	// 这时读写事务要获取 mmap 的写锁，就需要等待所有只读事务执行完毕后才能继续。
+	// 因此 Bolt 也建议用户，如果可能出现执行时间较长的只读事务，务必将 mmap 的初始大小调高一些。
+
+	// 获取mmaplock的read-only lock。这是读事务唯一会阻塞写事务的地方。
+	// 因为写事务在allocate新的page时，如果当前文件大小 不够分配free page，就要grow文件，并重新mmap映射。
+	// 所以，写事务 在re-mmap时会先获取mmaplock的exclusive lock，来阻塞读事务初始化，
+	// 同时读事务的初始化也会阻塞写事务的re-mmap操作
 	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
 	// obtain a write lock so all transactions must finish before it can be
 	// remapped.
@@ -527,6 +579,9 @@ func (db *DB) beginRWTx() (*Tx, error) {
 	t.init(db)
 	db.rwtx = t
 
+	// 当遇到删除数据时，读写事务会将多余的磁盘空间释放回 freelist 中，
+	// 此时 freelist 不会立即将其分配出去，而是将这些释放的 page 标记成 pending 状态，
+	// 直到系统中不存在任何读事务依赖这些 page 中的旧数据时，才正式将其回收再分配。
 	// Free any pages associated with closed read-only transactions.
 	var minid txid = 0xFFFFFFFFFFFFFFFF
 	for _, t := range db.txs {
@@ -534,6 +589,20 @@ func (db *DB) beginRWTx() (*Tx, error) {
 			minid = t.meta.txid
 		}
 	}
+	// boltdb 提供的是一写多读的 I，一写是用 W-Latch 保护的，而 Shadow Paging 天然支持了读写并发，
+	// 只要读事务访问到的 page 没有被新的 page 覆盖即可，
+	// 所以 boltdb 的 freelist 中维护了每个 tx 释放的旧 page id，
+	// 只有当所有读事务的 txid 都大于它时才能释放。(其实就相当于维护了多个版本的 B+ tree)
+	//
+	// Q: 为什么BoltDB把freelist.pending的释放操作，放到了读写事务开启阶段，
+	// 能不能在commit阶段将freelist.pending释放。
+	//
+	// A: 逻辑上，是可以在commit阶段释放freelist.pending的。
+	// 但是为了保证isolation，就要保证 写入freelist和metadata 的时候，不能有新的只读事务进行。
+	// 否则就会出现不一致的状态，内存中db.freelist上的pending已经释放了，但还在写入page。
+	// 此时新起的只读事务读取到的 metadata可能还是上一次事务的metadata，对应的freelist也是上一次事务的。
+	// 这是，database的freelist状态就不唯一了。
+	// 所以，在释放freelist.pending时，会获取metadata lock来保证
 	if minid > 0 {
 		db.freelist.release(minid - 1)
 	}
@@ -546,6 +615,7 @@ func (db *DB) removeTx(tx *Tx) {
 	// Release the read lock on the mmap.
 	db.mmaplock.RUnlock()
 
+	// 这里获取metalock，是为了保护对DB对象的访问，而不是保护meta对象
 	// Use the meta lock to restrict access to the DB object.
 	db.metalock.Lock()
 
@@ -640,6 +710,19 @@ func (db *DB) View(fn func(*Tx) error) error {
 	return nil
 }
 
+// 当我们使用Batch()方法时，内部会对将传递进去的fn缓存在calls中。
+//
+// 其内部也是调用了Update，只不过是在Update内部遍历之前缓存的calls。
+//
+// 有两种情况会触发调用Update。
+//
+// 1. 第一种情况是到达了MaxBatchDelay时间，就会触发Update
+// 2. 第二种情况是len(db.batch.calls) >= db.MaxBatchSize，即缓存的calls个数大于等于MaxBatchSize时，也会触发Update。
+//
+// Batch的本质是： 将每次写、每次刷盘的操作转变成了多次写、一次刷盘，从而提升性能。
+// 当多个 goroutine 同时调用时，会将多个写事务合并为一个大的写事务执行。
+// 若其中某个事务执行失败，其余的事务会重新执行，所以要求事务是幂等的。
+//
 // Batch calls fn as part of a batch. It behaves similar to Update,
 // except:
 //
@@ -729,6 +812,7 @@ retry:
 			// safe to shorten b.calls here because db.batch no longer
 			// points to us, and we hold the mutex anyway.
 			c := b.calls[failIdx]
+			//这儿只是把失败的事务给踢出去了，然后其他的事务会重新执行
 			b.calls[failIdx], b.calls = b.calls[len(b.calls)-1], b.calls[:len(b.calls)-1]
 			// tell the submitter re-run it solo, continue with the rest of the batch
 			c.err <- trySolo
@@ -823,6 +907,12 @@ func (db *DB) meta() *meta {
 	panic("bolt.DB.meta(): invalid meta pages")
 }
 
+// 这里的分配 page 不是真的分配文件中某一 page 来写，而是分配了一个 buffer 和起始的 page id，
+// 首先将 node 的信息写入这个 buffer，之后统一的写入 page id 对应的文件位置
+//
+// 无论是修改meta、freelist，还是修改或写入新B+Tree的node时，
+// boltdb都会先将数据按照page结构写入mmap内存空间外的page buffer中，
+// 等到事务提交时再将page buffer中数据写入到底层数据库文件相应的page处
 // allocate returns a contiguous block of memory starting at a given page.
 func (db *DB) allocate(count int) (*page, error) {
 	// Allocate a temporary buffer for the page.
@@ -849,6 +939,7 @@ func (db *DB) allocate(count int) (*page, error) {
 		}
 	}
 
+	// 如果不是从freelist中找到的空间的话，更新meta的id，也就意味着是从文件中新扩展的页
 	// Move the page id high water mark.
 	db.rwtx.meta.pgid += pgid(count)
 
@@ -967,16 +1058,21 @@ type Info struct {
 	PageSize int
 }
 
+// 这么看来，事务txid 相当于 数据的版本，每次操作数据库时，都会先获取这个逻辑上的版本。
+// 这么做的原因：由于写事务会对数据版本进行更改，由于COW的方式，
+// 旧的page会放到freelist.pending中等待释放，注意pending的数据结构是：map[txid][]pgid。
+// 所以，txid就可以相当于 某个时刻的数据版本，pending中记录的是这个txid时刻(注意txid只会是写事务)，
+// 旧的待释放的page。但释放这些旧page的时机BoltDB放在了，写事务开启的时候。
 type meta struct {
 	magic    uint32
 	version  uint32
-	pageSize uint32
-	flags    uint32
-	root     bucket
-	freelist pgid
-	pgid     pgid
-	txid     txid
-	checksum uint64
+	pageSize uint32 //page页的大小，该值和操作系统默认的页大小保持一致
+	flags    uint32 //保留字段，未使用
+	root     bucket //Bolt 实例所有索引和原数据被组织成一个树形结构，root 就是根节点
+	freelist pgid   //空闲页列表的首页id。Bolt 删除数据时可能出现富余的空间，这些空间的信息会被记录在 freelist 中备用
+	pgid     pgid   //下一个要被分配的 page 的 id，取值大于已分配的所有 pages 的 id
+	txid     txid   //上一次写数据库的事务ID，可以看作是当前boltdb的修改版本号，每次读写事务加1，只读事务时不改变
+	checksum uint64 //用作校验的校验和
 }
 
 // validate checks the marker bytes and version of the meta page to ensure it matches this binary.
@@ -1004,6 +1100,7 @@ func (m *meta) write(p *page) {
 		panic(fmt.Sprintf("freelist pgid (%d) above high water mark (%d)", m.freelist, m.pgid))
 	}
 
+	// 在更新元数据时，boltdb会交替写入两个meta页。这样，如果meta页写入中途数据库挂掉，数据库仍可以使用另一份完整的meta页。
 	// Page id is either going to be 0 or 1 which we can determine by the transaction ID.
 	p.id = pgid(m.txid % 2)
 	p.flags |= metaPageFlag

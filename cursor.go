@@ -6,6 +6,11 @@ import (
 	"sort"
 )
 
+// BoltDB是一个基于B+Tree组织的数据库，一个DB文件就是一棵树。
+// 但和普通的B+Tree相比，BoltDB 没有使用链表将所有叶子节点串在一起。
+// 为了支持对数据的顺序遍历，额外实现了一个 curosr 遍历逻辑，通过保存遍历栈来提高遍历效率、快速跳转。
+// leaf node 没有 sibling pointer，所以 boltdb 查找时用栈保存了查找路径，用于实现 range scan
+
 // Cursor represents an iterator that can traverse over all key/value pairs in a bucket in sorted order.
 // Cursors see nested buckets with value == nil.
 // Cursors can be obtained from a transaction and are valid as long as the transaction is open.
@@ -17,7 +22,7 @@ import (
 // after mutating data.
 type Cursor struct {
 	bucket *Bucket
-	stack  []elemRef
+	stack  []elemRef // Cursor.stack 中保存了查找对应 key 的路径，栈顶保存了 key 所在的结点和位置
 }
 
 // Bucket returns the bucket that this cursor was created from.
@@ -363,6 +368,8 @@ func (c *Cursor) node() *node {
 		return ref.node
 	}
 
+	// page 修改很小也需要写入整个 page，写放大较大，而且因为新分配了 page，
+	// 所以从 leaf 到 root 的所有 page 都会变为 dirty(因为修改了 child page id)，写放大就更大了。
 	// Start from root and traverse down the hierarchy.
 	var n = c.stack[0].node
 	if n == nil {

@@ -28,11 +28,16 @@ const (
 type pgid uint64
 
 type page struct {
-	id       pgid
-	flags    uint16
-	count    uint16
+	id pgid
+	// page类型标志。分为：metaPageFlag、freelistPageFlag、branchPageFlag、leafPageFlag
+	flags uint16
+	// 记录 page 中的元素个数
+	count uint16
+	// 当遇到体积巨大、单个 page 无法装下的数据时，会溢出到其它 pages，overflow 记录溢出总数
+	// 数据溢出当前page，用overflow表示后续的N个page都是当前page的数据。overflow的后续page只存放data，不存header
 	overflow uint32
-	ptr      uintptr
+	// 指向page数据起始位置的指针
+	ptr uintptr
 }
 
 // typ returns a human readable page type string used for debugging.
@@ -93,11 +98,18 @@ func (s pages) Len() int           { return len(s) }
 func (s pages) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func (s pages) Less(i, j int) bool { return s[i].id < s[j].id }
 
+// 在 page header 之后，顺序地排列着 page 中每个键(值)数据的元信息，即为 element header，
+// 每个 element header 记录具体键(值)数据的位置和大小，这种布局技术也被称为 Slotted Pages。
+
+// 非叶子节点的存储方式
+// ptr(branch): branchPageElement1 | branchPageElement2 | ... | branchPageElementN | k1 | k2 | ... | kn
+// branchPageElement: pos | ksize | pgid
+
 // branchPageElement represents a node on a branch page.
 type branchPageElement struct {
-	pos   uint32
+	pos   uint32 //该元信息和真实key之间的偏移量
 	ksize uint32
-	pgid  pgid
+	pgid  pgid //子节点所在 page 的 id
 }
 
 // key returns a byte slice of the node key.
@@ -106,9 +118,32 @@ func (n *branchPageElement) key() []byte {
 	return (*[maxAllocSize]byte)(unsafe.Pointer(&buf[n.pos]))[:n.ksize]
 }
 
+// 数据溢出，当需要存储超过单个 page 大小的数据时，比如：
+//
+// 1. branch/leaf page 遇到大的键值对数据
+// 2. freelist page 中空闲 page 列表较长
+// 我们该如何处理？Bolt 通过引入 overflow page 来解决这个问题，
+// 当需要存储超过单个 page 大小的数据时，就申请满足大小需求的连续 N 个 page，
+// 其中第 2 个到第 N 个是第 1 个 page 的 overflow，它们与第 1 个 page 共用 page header：
+
+// 叶子节点的存储方式
+// ptr(leaf): leafPageElement1 | leafPageElement2 | ... | leafPageElementN | k1 | v1 | k2 | v2 | ... | kn | vn
+// leafPageElement: flags | pos | ksize | vsize
+// flags:
+//    0: 叶子节点为普通的key-value类型
+//    1: 叶子节点为桶类型，其key为桶的key，当桶中的元素很少时，value会填充为桶的pgid以及其内联的kv节点数据
+//
+// boltdb支持任意长度的key和value，因此无法直接结构化保存key和value的列表。
+// 为了解决这一问题，branch page和leaf page的Page Body起始处是一个由定长的索引（branchPageElement或leafPageElement）组成的列表，
+// 第i个索引记录了第i个key或key/value的起始位置与key的长度或key/value各自的长度
+
 // leafPageElement represents a node on a leaf page.
 type leafPageElement struct {
+	//该值主要用来区分，是子桶叶子节点元素还是普通的key/value叶子节点元素。flags值为1时表示子桶。否则为key/value
 	flags uint32
+	// key值相对于此Element起始位置的偏移
+	// &leafPageElement + pos == &key。
+	// &leafPageElement + pos + ksize == &val
 	pos   uint32
 	ksize uint32
 	vsize uint32

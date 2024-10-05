@@ -32,11 +32,23 @@ const (
 // This value can be changed by setting Bucket.FillPercent.
 const DefaultFillPercent = 0.5
 
+// 这棵树的特性基本与教科书上的类似，但略有不同：
+//
+// 1. 整棵 B+ 树是完美平衡树，即每个 leaf node 的深度都一样;
+// 2. 除 root node之外，其它 node 的填充率需要大于 FillPercent，默认为 50%;
+// 3. 所有的键值对都存储在 leaf node 中，branch node 只存储每个 child node 的最小键 (如上图箭头所示)，键的大小由键的字节序决定。
+
+// 与教科书上介绍的 B+ 树操作不同，Bolt 在更新 B+ 树数据时不会直接修改树的结构，而是只更新数据。
+// 在数据写入磁盘前才按需合并、分裂 node，恢复 B+ 树的不变性；
+// 严格地说，Bolt 中的 B+ 树是一棵磁盘中的 B+ 树，在内存中执行更新操作且尚未写入磁盘前，
+// 它可能不符合 B+ 树的特性。
+
 // Bucket represents a collection of key/value pairs inside the database.
+// 尽管每个桶内部的数据是合法的 B+ 树，但多个Bucket共同组成的树通常不是 B+ 树。
 type Bucket struct {
 	*bucket
 	tx       *Tx                // the associated transaction
-	buckets  map[string]*Bucket // subbucket cache
+	buckets  map[string]*Bucket // subbucket cache, 该字段记录了当前事务已打开的当前bucket的子bucket
 	page     *page              // inline page reference
 	rootNode *node              // materialized node for the root page.
 	nodes    map[pgid]*node     // node cache
@@ -46,14 +58,27 @@ type Bucket struct {
 	// amount if you know that your write workloads are mostly append-only.
 	//
 	// This is non-persisted across transactions so it must be set in every Tx.
+	// 填充率
 	FillPercent float64
 }
+
+// regular bucket layout(KV):
+// K: bucketName | V: root+sequence
+//
+// inline bucket layout(KV)
+// K: bucketName | V: root+sequence+VirutalRootPage
 
 // bucket represents the on-file representation of a bucket.
 // This is stored as the "value" of a bucket key. If the bucket is small enough,
 // then its root page can be stored inline in the "value", after the bucket
 // header. In the case of inline buckets, the "root" will be 0.
 type bucket struct {
+	// root 如果等于0，说明是内嵌的bucket
+	// 如果我们为每个新桶都分配一个单独的 page，在需要大量使用小桶的场景下，会产生内部碎片，浪费存储空间
+	// Bolt 使用 inline-bucket 来解决上述问题。
+	// inline-bucket 不会占用单独的 page，一个虚拟的 page，逻辑上它就是一个 page。
+	// 每个 inline-page 中同样存有 page header，element headers 和 data，
+	// 存储时它将被序列化成一般的二进制数据与桶名一起作为普通键值数据储存。
 	root     pgid   // page id of the bucket's root-level page
 	sequence uint64 // monotonically incrementing, used by NextSequence()
 }
@@ -130,6 +155,9 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 func (b *Bucket) openBucket(value []byte) *Bucket {
 	var child = newBucket(b.tx)
 
+	// 还会检测当前平台架构是否需要4字节对齐，如果需要对齐即使是只读事务，
+	// 也需要将mmap memory中的数据拷贝到heap memory中以对齐
+	//
 	// If unaligned load/stores are broken on this arch and value is
 	// unaligned simply clone to an aligned byte array.
 	unaligned := brokenUnaligned && uintptr(unsafe.Pointer(&value[0]))&3 != 0
@@ -191,6 +219,9 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	key = cloneBytes(key)
 	c.node().put(key, key, value, 0, bucketLeafFlag)
 
+	// 如果当前bucket为inline bucket，则在创建子bucket后其不再为inline bucket，
+	// 因此将其page字段置为nil，以便当前事务后续操作中将其作为普通bucket处理
+	//
 	// Since subbuckets are not allowed on inline buckets, we need to
 	// dereference the inline page, if it exists. This will cause the bucket
 	// to be treated as a regular, non-inline bucket for the rest of the tx.
@@ -531,6 +562,8 @@ func (b *Bucket) spill() error {
 		// like a normal bucket and make the parent value a pointer to the page.
 		var value []byte
 		if child.inlineable() {
+			// 如果子bucket可存储为inline bucket，则调用free方法，释放子bucket所有的页，
+			// 并将其元数据与数据写入到value中
 			child.free()
 			value = child.write()
 		} else {
@@ -538,12 +571,15 @@ func (b *Bucket) spill() error {
 				return err
 			}
 
+			// 如果子bucket为regular bucket，则递归调用其spill方法，
+			// 将其中更新写入到page buffer中，然后将其元数据写入到value中
 			// Update the child bucket header in this bucket.
 			value = make([]byte, unsafe.Sizeof(bucket{}))
 			var bucket = (*bucket)(unsafe.Pointer(&value[0]))
 			*bucket = *child.bucket
 		}
 
+		// 如果子bucket没有实例化其B+Tree的根node，说明其没有更新，因此跳过该子bucket，继续处理后续子bucket
 		// Skip writing the bucket if there are no materialized nodes.
 		if child.rootNode == nil {
 			continue
@@ -561,11 +597,13 @@ func (b *Bucket) spill() error {
 		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
 	}
 
+	// 如果当前bucekt没有实例化其B+Tree的根node，说明其没有更新，因此直接返回
 	// Ignore if there's not a materialized root node.
 	if b.rootNode == nil {
 		return nil
 	}
 
+	// 如果当前bucekt中有更新，则调用根节点的spill方法，该方法会递归调用整棵B+Tree中已实例化的node的spill方法
 	// Spill nodes.
 	if err := b.rootNode.spill(); err != nil {
 		return err
@@ -612,6 +650,7 @@ func (b *Bucket) maxInlineBucketSize() int {
 	return b.tx.db.pageSize / 4
 }
 
+// write是序列化inline bucket的方法
 // write allocates and writes a bucket to a byte slice.
 func (b *Bucket) write() []byte {
 	// Allocate the appropriate size.
@@ -639,6 +678,7 @@ func (b *Bucket) rebalance() {
 	}
 }
 
+// node方法时是明确需要更新节点时才需要调用的。而如果只需要读取节点，Bucket提供了pageNode方法
 // node creates a node from a page and associates it with a given parent.
 func (b *Bucket) node(pgid pgid, parent *node) *node {
 	_assert(b.nodes != nil, "nodes map expected")
@@ -656,6 +696,10 @@ func (b *Bucket) node(pgid pgid, parent *node) *node {
 		parent.children = append(parent.children, n)
 	}
 
+	// 选择需要读取的page，如果当前bucket不是inline bucket，
+	// 则通过事务实例获取传入的pgid相应的page的指针（如果page被修改，该方法会返回page buffer，否则返回mmap中的page）；
+	// 否则，直接使用bucket的虚拟页
+	//
 	// Use the inline page if this is an inline bucket.
 	var p = b.page
 	if p == nil {
@@ -700,6 +744,9 @@ func (b *Bucket) dereference() {
 	}
 }
 
+// node方法时是明确需要更新节点时才需要调用的。而如果只需要读取节点，Bucket提供了pageNode方法，
+// pageNode方法会返回给定pgid相应的page或node。即如果该节点已被实例化为node，则返回node，否则直接返回page
+//
 // pageNode returns the in-memory node, if it exists.
 // Otherwise returns the underlying page.
 func (b *Bucket) pageNode(id pgid) (*page, *node) {

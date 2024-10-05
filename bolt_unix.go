@@ -1,3 +1,4 @@
+//go:build !windows && !plan9 && !solaris
 // +build !windows,!plan9,!solaris
 
 package bolt
@@ -44,6 +45,9 @@ func funlock(db *DB) error {
 	return syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
 }
 
+// boltdb 没有实现 page cache，而是调用 mmap() 将整个文件映射进来，
+// 并调用 madvise(MADV_RANDOM) 由操作系统管理 page cache，
+// 后续对磁盘上文件的所有读操作直接读取 db.data 即可
 // mmap memory maps a DB's data file.
 func mmap(db *DB, sz int) error {
 	// Map the data file to memory.
@@ -52,6 +56,7 @@ func mmap(db *DB, sz int) error {
 		return err
 	}
 
+	// MADV_RANDOM: 随机访问模式，不会进行 read-ahead 和 read-behind。
 	// Advise the kernel that the mmap is accessed randomly.
 	if err := madvise(b, syscall.MADV_RANDOM); err != nil {
 		return fmt.Errorf("madvise: %s", err)

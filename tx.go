@@ -23,11 +23,11 @@ type txid uint64
 // quickly grow.
 type Tx struct {
 	writable       bool
-	managed        bool
+	managed        bool // 通过Update或View方法启动隐式事务
 	db             *DB
 	meta           *meta
 	root           Bucket
-	pages          map[pgid]*page
+	pages          map[pgid]*page // 索引当前事务所使用的dirty page（page buffer）。
 	stats          TxStats
 	commitHandlers []func()
 
@@ -45,6 +45,9 @@ func (tx *Tx) init(db *DB) {
 	tx.db = db
 	tx.pages = nil
 
+	// meta page 存储数据库的元信息，包括 root bucket 等。
+	// 在读写事务执行过程中，可能在增删改键值数据的过程中修改 root bucket，引起 meta page 的变化。
+	// 因此在初始化事务时，每个事务都需要复制一份独立 meta，以防止读写事务的执行影响到只读事务。
 	// Copy the meta page since it can be changed by the writer.
 	tx.meta = &meta{}
 	db.meta().copy(tx.meta)
@@ -138,6 +141,28 @@ func (tx *Tx) OnCommit(fn func()) {
 	tx.commitHandlers = append(tx.commitHandlers, fn)
 }
 
+// Commit 总体思路是：
+//
+// 1. 先判定节点要不要合并、分裂
+// 2. 对空闲列表的判断，是否存在溢出的情况，溢出的话，需要重新分配空间
+// 3. 将事务中涉及改动的页进行排序(保证尽可能的顺序IO)，排序后循环写入到磁盘中，最后再执行刷盘
+// 4. 当数据写入成功后，再将元信息页写到磁盘中，刷盘以保证持久化
+// 5. 上述操作中，但凡有失败，当前事务都会进行回滚
+//
+// 在内存中允许 B+ 树发生临时「变形」，落盘前再统一矫正，保证磁盘中的 B+ 树符合要求
+// 在读写事务提交时，Bolt 通过 rebalance 和 spill 来保证最终写入磁盘的是一棵合法的 B+ 树：
+//
+// boltdb 对 B+ 树的生长以事务为周期，而且生长只发生在写事务中。
+// 在写事务开始后，会复制 root bucket 的根节点，然后将改动涉及到的节点按需加载到内存，并在内存中进行修改。
+// 在写事务结束前，在对 B+ 树调整后，将所有改动涉及到的 node 申请新的 page，写回文件系统，完成 B+ 树一次生长。
+// 释放的树节点，在没有读事务占用后，会进入 freelist 供之后使用。
+//
+// Q: BoltDB读写事务执行到一半时掉电重启，如在commit阶段，刚写完dirty pages，正在写meta page时掉电重启。这时如何保证原子性呢。
+// A: 我们知道BoltDB采用的COW机制，所以更新操作会创建新page 再进行写文件，而老的page则不去改动，但会标记成free。
+// 所以BoltDB通过freelist结构来记录老的free page，对这些free page，尽管物理上有值，逻辑上它已经是free的了，仍然可提供给新的node写入。
+// 到这里就回答了上面的问题，BoltDB是通过meta page的写入成功来表保证事务的原子性。
+// 如果meta page写失败，则BoltDB新写的page增量对用户来说不可见，也就是实现了事务的原子性。
+//
 // Commit writes all changes to disk and updates the meta page.
 // Returns an error if a disk write error occurs, or if Commit is
 // called on a read-only transaction.
@@ -160,6 +185,10 @@ func (tx *Tx) Commit() error {
 
 	// spill data onto dirty pages.
 	startTime = time.Now()
+	// rebalance 之后，内存中的树装结构满足：所有 node 的数据填充率都大于 FillPercent。
+	// 但这些 node 的填充率可能远远大于 100%，
+	// 因此就需要 spill 操作从反方向将所有 node 的填充率控制在 FillPercent 之下。
+	// 这个内部会往缓存tx.pages中加page
 	if err := tx.root.spill(); err != nil {
 		tx.rollback()
 		return err
@@ -173,6 +202,7 @@ func (tx *Tx) Commit() error {
 
 	// Free the freelist and allocate new pages for it. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
+	// freelist写入新的page，这样在meta成功写入前断电了，也能保证一致性
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
@@ -235,6 +265,10 @@ func (tx *Tx) Commit() error {
 	return nil
 }
 
+// Rollback()中，主要对不同事务进行不同操作：
+//
+// 1. 如果当前事务是只读事务，则只需要从db中的txs中找到当前事务，然后移除掉即可。
+// 2. 如果当前事务是读写事务，则需要将空闲列表中和该事务关联的页释放掉，同时重新从freelist中加载空闲页。
 // Rollback closes the transaction and ignores all previous updates. Read-only
 // transactions must be rolled back and not committed.
 func (tx *Tx) Rollback() error {
@@ -251,7 +285,10 @@ func (tx *Tx) rollback() {
 		return
 	}
 	if tx.writable {
+		// 首先要通过freelist的rollback方法，删除当前事务的penging列表中记录的页，因为这些页会被复用而不需要释放
 		tx.db.freelist.rollback(tx.meta.txid)
+		// 还需要调用freelist的reload方法，其目的是将当前事务分配的页重新加入到freelist中；
+		// 否则，这些页会无法引用，导致完整性检查失败。
 		tx.db.freelist.reload(tx.db.page(tx.db.meta().freelist))
 	}
 	tx.close()
@@ -470,6 +507,10 @@ func (tx *Tx) allocate(count int) (*page, error) {
 	return p, nil
 }
 
+// 读写事务提交时，会将所有脏页 (dirty pages) 落盘。
+// 落盘前，Bolt 会将这些 page 按 page id 升序排列，然后依次写出到磁盘中。
+// 由于数据库文件中的所有 page 按 id 升序排列并两两相邻，这样写出就是顺序写，对块存储设备十分友好。
+//
 // write writes any dirty pages to disk.
 func (tx *Tx) write() error {
 	// Sort pages by id.
@@ -497,6 +538,7 @@ func (tx *Tx) write() error {
 
 			// Write chunk to disk.
 			buf := ptr[:sz]
+			// go语言通过pwrite系统调用实现WriteAt
 			if _, err := tx.db.ops.writeAt(buf, offset); err != nil {
 				return err
 			}
@@ -516,6 +558,12 @@ func (tx *Tx) write() error {
 		}
 	}
 
+	// 通过实践和mmap的MAP_SHARED模式的描述可知，使用SHARED的mmap，
+	// 当其它进程通过fdatasync等系统调用修改底层文件后，修改能通过mmap的内存访问到
+	//
+	// 连接mmap与pwrite + fdatasync的桥梁，是操作系统。
+	// 操作系统保证了通过MAP_SHARED映射的内存空间在底层文件修改时会更新。
+	// boltdb的mmap模式为MAP_SHARED，因此绕过mmap直接写入底层文件不会影响mmap中数据对底层文件修改的可见性。
 	// Ignore file sync if flag is set on DB.
 	if !tx.db.NoSync || IgnoreNoSync {
 		if err := fdatasync(tx.db); err != nil {
